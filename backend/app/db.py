@@ -74,6 +74,11 @@ DEFAULT_CARDS = [
     ),
 ]
 
+# Sentinel used to temporarily park a card outside valid position space while
+# source and destination columns are reindexed, avoiding UNIQUE(column_id, position)
+# constraint collisions during cross-column moves.
+_REINDEX_PLACEHOLDER = -(10 ** 6)
+
 
 class BoardNotFoundError(Exception):
     pass
@@ -95,7 +100,22 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 
 
 def _hash_password(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    """Hash a password with a random salt using scrypt. Returns 'salt_hex:hash_hex'."""
+    salt = secrets.token_bytes(16)
+    hash_bytes = hashlib.scrypt(value.encode("utf-8"), salt=salt, n=16384, r=8, p=1)
+    return f"{salt.hex()}:{hash_bytes.hex()}"
+
+
+def _verify_password(value: str, stored: str) -> bool:
+    """Verify a plaintext value against a stored scrypt hash."""
+    try:
+        salt_hex, hash_hex = stored.split(":", 1)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(hash_hex)
+        actual = hashlib.scrypt(value.encode("utf-8"), salt=salt, n=16384, r=8, p=1)
+        return secrets.compare_digest(actual, expected)
+    except Exception:
+        return False
 
 
 def initialize_database(db_path: Path) -> None:
@@ -179,11 +199,12 @@ def initialize_database(db_path: Path) -> None:
 
 
 def _seed_mvp_user_data(connection: sqlite3.Connection) -> None:
+    # Always update the password hash to ensure it uses the current algorithm.
     connection.execute(
         """
         INSERT INTO users (username, password_hash)
         VALUES (?, ?)
-        ON CONFLICT(username) DO NOTHING
+        ON CONFLICT(username) DO UPDATE SET password_hash = excluded.password_hash
         """,
         (MVP_USERNAME, _hash_password(MVP_PASSWORD)),
     )
@@ -254,7 +275,7 @@ def verify_credentials(db_path: Path, username: str, password: str) -> bool:
         ).fetchone()
         if row is None:
             return False
-        return row["password_hash"] == _hash_password(password)
+        return _verify_password(password, row["password_hash"])
 
 
 def _get_board_id(connection: sqlite3.Connection, username: str) -> str:
@@ -341,30 +362,133 @@ def rename_column(db_path: Path, username: str, column_id: str, title: str) -> d
         return _build_board_payload(connection, board_id)
 
 
+# === Connection-scoped mutation helpers (used by public API and batch operations) ===
+
+
+def _do_create_card(
+    connection: sqlite3.Connection,
+    board_id: str,
+    column_id: str,
+    title: str,
+    details: str,
+) -> None:
+    column_row = connection.execute(
+        "SELECT 1 FROM board_columns WHERE board_id = ? AND id = ?",
+        (board_id, column_id),
+    ).fetchone()
+    if column_row is None:
+        raise ColumnNotFoundError(column_id)
+
+    next_position = connection.execute(
+        "SELECT COALESCE(MAX(position), -1) + 1 AS next_pos FROM cards WHERE column_id = ?",
+        (column_id,),
+    ).fetchone()["next_pos"]
+
+    card_id = f"card-{secrets.token_hex(6)}"
+    connection.execute(
+        """
+        INSERT INTO cards (id, board_id, column_id, title, details, position, metadata_json)
+        VALUES (?, ?, ?, ?, ?, ?, '{}')
+        """,
+        (card_id, board_id, column_id, title, details, int(next_position)),
+    )
+
+
+def _do_update_card(
+    connection: sqlite3.Connection,
+    board_id: str,
+    card_id: str,
+    title: str | None,
+    details: str | None,
+) -> None:
+    existing = connection.execute(
+        "SELECT id FROM cards WHERE board_id = ? AND id = ?",
+        (board_id, card_id),
+    ).fetchone()
+    if existing is None:
+        raise CardNotFoundError(card_id)
+
+    if title is None and details is None:
+        return
+
+    if title is not None:
+        connection.execute(
+            "UPDATE cards SET title = ?, updated_at = datetime('now') WHERE id = ?",
+            (title, card_id),
+        )
+
+    if details is not None:
+        connection.execute(
+            "UPDATE cards SET details = ?, updated_at = datetime('now') WHERE id = ?",
+            (details, card_id),
+        )
+
+
+def _do_move_card(
+    connection: sqlite3.Connection,
+    board_id: str,
+    card_id: str,
+    destination_column_id: str,
+    destination_position: int | None,
+) -> None:
+    card_row = connection.execute(
+        "SELECT id, column_id FROM cards WHERE board_id = ? AND id = ?",
+        (board_id, card_id),
+    ).fetchone()
+    if card_row is None:
+        raise CardNotFoundError(card_id)
+
+    source_column_id = str(card_row["column_id"])
+
+    destination_column = connection.execute(
+        "SELECT id FROM board_columns WHERE board_id = ? AND id = ?",
+        (board_id, destination_column_id),
+    ).fetchone()
+    if destination_column is None:
+        raise ColumnNotFoundError(destination_column_id)
+
+    source_ids = _load_ordered_card_ids(connection, source_column_id)
+    if card_id not in source_ids:
+        raise CardNotFoundError(card_id)
+
+    source_ids.remove(card_id)
+
+    if source_column_id == destination_column_id:
+        insert_position = len(source_ids)
+        if destination_position is not None:
+            insert_position = max(0, min(destination_position, len(source_ids)))
+        source_ids.insert(insert_position, card_id)
+        _reindex_column(connection, source_column_id, source_ids)
+        return
+
+    destination_ids = _load_ordered_card_ids(connection, destination_column_id)
+    insert_position = len(destination_ids)
+    if destination_position is not None:
+        insert_position = max(0, min(destination_position, len(destination_ids)))
+    destination_ids.insert(insert_position, card_id)
+
+    # Park the card at a placeholder position outside valid space so that
+    # source reindexing does not collide with the card's previous position.
+    connection.execute(
+        """
+        UPDATE cards
+        SET column_id = ?, position = ?, updated_at = datetime('now')
+        WHERE id = ?
+        """,
+        (destination_column_id, _REINDEX_PLACEHOLDER, card_id),
+    )
+
+    _reindex_column(connection, source_column_id, source_ids)
+    _reindex_column(connection, destination_column_id, destination_ids)
+
+
+# === Public API functions ===
+
+
 def create_card(db_path: Path, username: str, column_id: str, title: str, details: str) -> dict:
     with _connect(db_path) as connection:
         board_id = _get_board_id(connection, username)
-
-        column_row = connection.execute(
-            "SELECT 1 FROM board_columns WHERE board_id = ? AND id = ?",
-            (board_id, column_id),
-        ).fetchone()
-        if column_row is None:
-            raise ColumnNotFoundError(column_id)
-
-        next_position = connection.execute(
-            "SELECT COALESCE(MAX(position), -1) + 1 AS next_pos FROM cards WHERE column_id = ?",
-            (column_id,),
-        ).fetchone()["next_pos"]
-
-        card_id = f"card-{secrets.token_hex(6)}"
-        connection.execute(
-            """
-            INSERT INTO cards (id, board_id, column_id, title, details, position, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, '{}')
-            """,
-            (card_id, board_id, column_id, title, details, int(next_position)),
-        )
+        _do_create_card(connection, board_id, column_id, title, details)
         return _build_board_payload(connection, board_id)
 
 
@@ -377,29 +501,7 @@ def update_card(
 ) -> dict:
     with _connect(db_path) as connection:
         board_id = _get_board_id(connection, username)
-
-        existing = connection.execute(
-            "SELECT id FROM cards WHERE board_id = ? AND id = ?",
-            (board_id, card_id),
-        ).fetchone()
-        if existing is None:
-            raise CardNotFoundError(card_id)
-
-        if title is None and details is None:
-            return _build_board_payload(connection, board_id)
-
-        if title is not None:
-            connection.execute(
-                "UPDATE cards SET title = ?, updated_at = datetime('now') WHERE id = ?",
-                (title, card_id),
-            )
-
-        if details is not None:
-            connection.execute(
-                "UPDATE cards SET details = ?, updated_at = datetime('now') WHERE id = ?",
-                (details, card_id),
-            )
-
+        _do_update_card(connection, board_id, card_id, title, details)
         return _build_board_payload(connection, board_id)
 
 
@@ -423,6 +525,19 @@ def delete_card(db_path: Path, username: str, card_id: str) -> dict:
             (column_id, position),
         )
 
+        return _build_board_payload(connection, board_id)
+
+
+def move_card(
+    db_path: Path,
+    username: str,
+    card_id: str,
+    destination_column_id: str,
+    destination_position: int | None,
+) -> dict:
+    with _connect(db_path) as connection:
+        board_id = _get_board_id(connection, username)
+        _do_move_card(connection, board_id, card_id, destination_column_id, destination_position)
         return _build_board_payload(connection, board_id)
 
 
@@ -458,69 +573,6 @@ def _reindex_column(
             """,
             (column_id, index, id_value),
         )
-
-
-def move_card(
-    db_path: Path,
-    username: str,
-    card_id: str,
-    destination_column_id: str,
-    destination_position: int | None,
-) -> dict:
-    with _connect(db_path) as connection:
-        board_id = _get_board_id(connection, username)
-
-        card_row = connection.execute(
-            "SELECT id, column_id FROM cards WHERE board_id = ? AND id = ?",
-            (board_id, card_id),
-        ).fetchone()
-        if card_row is None:
-            raise CardNotFoundError(card_id)
-
-        source_column_id = str(card_row["column_id"])
-
-        destination_column = connection.execute(
-            "SELECT id FROM board_columns WHERE board_id = ? AND id = ?",
-            (board_id, destination_column_id),
-        ).fetchone()
-        if destination_column is None:
-            raise ColumnNotFoundError(destination_column_id)
-
-        source_ids = _load_ordered_card_ids(connection, source_column_id)
-        if card_id not in source_ids:
-            raise CardNotFoundError(card_id)
-
-        source_ids.remove(card_id)
-
-        if source_column_id == destination_column_id:
-            insert_position = len(source_ids)
-            if destination_position is not None:
-                insert_position = max(0, min(destination_position, len(source_ids)))
-            source_ids.insert(insert_position, card_id)
-            _reindex_column(connection, source_column_id, source_ids)
-            return _build_board_payload(connection, board_id)
-
-        destination_ids = _load_ordered_card_ids(connection, destination_column_id)
-        insert_position = len(destination_ids)
-        if destination_position is not None:
-            insert_position = max(0, min(destination_position, len(destination_ids)))
-        destination_ids.insert(insert_position, card_id)
-
-        # Move the card out of the source column first so source reindexing
-        # does not collide with the card's previous (column_id, position).
-        connection.execute(
-            """
-            UPDATE cards
-            SET column_id = ?, position = -999999, updated_at = datetime('now')
-            WHERE id = ?
-            """,
-            (destination_column_id, card_id),
-        )
-
-        _reindex_column(connection, source_column_id, source_ids)
-        _reindex_column(connection, destination_column_id, destination_ids)
-
-        return _build_board_payload(connection, board_id)
 
 
 def _get_or_create_thread_id(connection: sqlite3.Connection, board_id: str) -> int:

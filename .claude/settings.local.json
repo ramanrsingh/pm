@@ -8,7 +8,9 @@
       "Read(//c/Users/admin/**)",
       "Bash(npm run:*)",
       "Bash(pip:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(docker:*)",
+      "Bash(curl:*)"
     ]
   }
 }

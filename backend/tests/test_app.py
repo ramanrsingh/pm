@@ -62,7 +62,9 @@ def test_login_sets_cookie_and_me_returns_authenticated(tmp_path: Path) -> None:
     me_response = client.get("/api/auth/me")
 
     assert login_response.status_code == 200
-    assert "pm_auth=user" in login_response.headers["set-cookie"]
+    # Cookie must be set; value is an opaque session token, not the username.
+    assert "pm_auth=" in login_response.headers["set-cookie"]
+    assert "pm_auth=user" not in login_response.headers["set-cookie"]
     assert me_response.status_code == 200
     assert me_response.json()["status"] == "authenticated"
     assert me_response.json()["username"] == "user"
@@ -78,6 +80,16 @@ def test_logout_clears_session_cookie(tmp_path: Path) -> None:
     assert logout_response.status_code == 200
     assert "pm_auth=" in logout_response.headers["set-cookie"]
     assert me_response.status_code == 401
+
+
+def test_forged_cookie_is_rejected(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+
+    # Bypass login and manually set the cookie to the username directly.
+    client.cookies.set("pm_auth", "user")
+    response = client.get("/api/auth/me")
+
+    assert response.status_code == 401
 
 
 def test_ai_chat_requires_authentication(tmp_path: Path) -> None:
@@ -99,7 +111,7 @@ def test_ai_chat_returns_assistant_payload_for_prompt(tmp_path: Path, monkeypatc
     assert response.status_code == 200
     assert response.json()["assistant"]["role"] == "assistant"
     assert response.json()["assistant"]["content"] == "4"
-    assert response.json()["model"] == "openai/gpt-oss-120b:free"
+    assert "model" not in response.json()
 
 
 def test_ai_chat_returns_bad_request_for_blank_prompt(tmp_path: Path) -> None:
@@ -189,3 +201,30 @@ def test_ai_chat_unparseable_output_does_not_mutate_board(tmp_path: Path, monkey
 
     after = client.get("/api/board").json()["board"]
     assert after == before
+
+
+def test_ai_chat_partial_operation_failure(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Valid operations succeed and invalid operations accumulate errors independently."""
+    client = make_client(tmp_path)
+    client.post("/api/auth/login", json={"username": "user", "password": "password"})
+
+    monkeypatch.setattr(
+        "app.main.request_ai_reply",
+        lambda prompt: (
+            '{"assistantMessage":"Tried two things.",'
+            '"operations":['
+            '{"type":"create_card","columnId":"col-backlog","title":"Good Card","details":"ok"},'
+            '{"type":"edit_card","cardId":"card-does-not-exist","title":"Will fail"}'
+            ']}'
+        ),
+    )
+
+    response = client.post("/api/ai/chat", json={"prompt": "do two things"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["boardUpdated"] is True
+    assert len(payload["appliedOperations"]) == 1
+    assert payload["appliedOperations"][0]["type"] == "create_card"
+    assert len(payload["operationErrors"]) == 1
+    assert any(card["title"] == "Good Card" for card in payload["board"]["cards"].values())

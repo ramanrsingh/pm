@@ -1,14 +1,17 @@
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 from app.db import (
     CardNotFoundError,
     ColumnNotFoundError,
-    create_card,
-    get_board_for_user,
-    move_card,
-    update_card,
+    _build_board_payload,
+    _connect,
+    _do_create_card,
+    _do_move_card,
+    _do_update_card,
+    _get_board_id,
 )
 
 OPERATION_TYPES = {"create_card", "edit_card", "move_card"}
@@ -180,55 +183,61 @@ def _validate_move_payload(operation: dict[str, Any]) -> tuple[str, str, int | N
 
 
 def apply_ai_operations(
-    db_path,
+    db_path: Path,
     username: str,
     operations: list[dict[str, Any]],
 ) -> tuple[dict, list[dict[str, Any]], list[str]]:
+    """Apply a list of AI-generated board operations in a single DB transaction."""
     applied: list[dict[str, Any]] = []
     errors: list[str] = []
 
-    for index, operation in enumerate(operations):
-        op_type = operation.get("type")
-        try:
-            if op_type == "create_card":
-                create_data = _validate_create_payload(operation)
-                if create_data is None:
-                    errors.append(f"Operation {index} invalid create_card payload.")
+    with _connect(db_path) as connection:
+        board_id = _get_board_id(connection, username)
+
+        for index, operation in enumerate(operations):
+            op_type = operation.get("type")
+            try:
+                if op_type == "create_card":
+                    create_data = _validate_create_payload(operation)
+                    if create_data is None:
+                        errors.append(f"Operation {index} invalid create_card payload.")
+                        continue
+                    column_id, title, details = create_data
+                    _do_create_card(connection, board_id, column_id, title, details)
+                    applied.append({"index": index, "type": op_type})
                     continue
-                column_id, title, details = create_data
-                create_card(db_path, username, column_id, title, details)
-                applied.append({"index": index, "type": op_type})
-                continue
 
-            if op_type == "edit_card":
-                edit_data = _validate_edit_payload(operation)
-                if edit_data is None:
-                    errors.append(f"Operation {index} invalid edit_card payload.")
+                if op_type == "edit_card":
+                    edit_data = _validate_edit_payload(operation)
+                    if edit_data is None:
+                        errors.append(f"Operation {index} invalid edit_card payload.")
+                        continue
+                    card_id, title, details = edit_data
+                    _do_update_card(connection, board_id, card_id, title, details)
+                    applied.append({"index": index, "type": op_type, "cardId": card_id})
                     continue
-                card_id, title, details = edit_data
-                update_card(db_path, username, card_id, title, details)
-                applied.append({"index": index, "type": op_type, "cardId": card_id})
-                continue
 
-            if op_type == "move_card":
-                move_data = _validate_move_payload(operation)
-                if move_data is None:
-                    errors.append(f"Operation {index} invalid move_card payload.")
+                if op_type == "move_card":
+                    move_data = _validate_move_payload(operation)
+                    if move_data is None:
+                        errors.append(f"Operation {index} invalid move_card payload.")
+                        continue
+                    card_id, column_id, position = move_data
+                    _do_move_card(connection, board_id, card_id, column_id, position)
+                    applied.append(
+                        {
+                            "index": index,
+                            "type": op_type,
+                            "cardId": card_id,
+                            "columnId": column_id,
+                        }
+                    )
                     continue
-                card_id, column_id, position = move_data
-                move_card(db_path, username, card_id, column_id, position)
-                applied.append(
-                    {
-                        "index": index,
-                        "type": op_type,
-                        "cardId": card_id,
-                        "columnId": column_id,
-                    }
-                )
-                continue
 
-            errors.append(f"Operation {index} has unsupported type.")
-        except (ColumnNotFoundError, CardNotFoundError) as exc:
-            errors.append(f"Operation {index} failed: {exc.__class__.__name__}.")
+                errors.append(f"Operation {index} has unsupported type.")
+            except (ColumnNotFoundError, CardNotFoundError) as exc:
+                errors.append(f"Operation {index} failed: {exc.__class__.__name__}.")
 
-    return get_board_for_user(db_path, username), applied, errors
+        board = _build_board_payload(connection, board_id)
+
+    return board, applied, errors

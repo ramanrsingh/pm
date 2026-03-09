@@ -1,12 +1,13 @@
 import os
+import secrets
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import Cookie, FastAPI, HTTPException, Response, status
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StringConstraints
 
 from app.ai import (
-    OPENROUTER_MODEL,
     AIProviderError,
     AITimeoutError,
     MissingApiKeyError,
@@ -17,11 +18,9 @@ from app.db import (
     BoardNotFoundError,
     CardNotFoundError,
     ColumnNotFoundError,
-    MVP_PASSWORD,
-    MVP_USERNAME,
+    append_chat_message_for_user,
     create_card,
     delete_card,
-    append_chat_message_for_user,
     get_board_for_user,
     initialize_database,
     list_chat_messages_for_user,
@@ -36,6 +35,9 @@ DEFAULT_STATIC_DIR = Path(__file__).resolve().parent / "static"
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "pm.db"
 AUTH_COOKIE_NAME = "pm_auth"
 
+# Shared type for non-empty stripped strings used in payloads.
+NonEmptyStr = Annotated[str, StringConstraints(min_length=1, strip_whitespace=True)]
+
 
 class LoginPayload(BaseModel):
     username: str
@@ -43,12 +45,12 @@ class LoginPayload(BaseModel):
 
 
 class RenameColumnPayload(BaseModel):
-    title: str
+    title: NonEmptyStr
 
 
 class CreateCardPayload(BaseModel):
     columnId: str
-    title: str
+    title: NonEmptyStr
     details: str = ""
 
 
@@ -75,41 +77,46 @@ def resolve_db_path() -> Path:
     return Path(os.environ.get("DB_PATH", str(DEFAULT_DB_PATH)))
 
 
-def _require_username(pm_auth: str | None) -> str:
-    if not pm_auth:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated.",
-        )
-    return pm_auth
-
-
 def create_app(frontend_dir: Path | None = None, db_path: Path | None = None) -> FastAPI:
     app = FastAPI(title="Project Management MVP API")
     app.state.db_path = db_path or resolve_db_path()
+    app.state.sessions: dict[str, str] = {}  # token -> username
     initialize_database(app.state.db_path)
+
+    def require_username(
+        request: Request,
+        pm_auth: str | None = Cookie(default=None),
+    ) -> str:
+        if not pm_auth:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Not authenticated.",
+            )
+        username = request.app.state.sessions.get(pm_auth)
+        if not username:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Not authenticated.",
+            )
+        return username
 
     @app.get("/api/health")
     async def health() -> dict[str, str]:
         return {"status": "ok", "service": "pm-backend"}
 
     @app.post("/api/auth/login")
-    async def login(payload: LoginPayload, response: Response) -> dict[str, str]:
-        if payload.username != MVP_USERNAME or payload.password != MVP_PASSWORD:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid username or password.",
-            )
-
+    async def login(payload: LoginPayload, response: Response, request: Request) -> dict[str, str]:
         if not verify_credentials(app.state.db_path, payload.username, payload.password):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid username or password.",
             )
 
+        token = secrets.token_hex(32)
+        request.app.state.sessions[token] = payload.username
         response.set_cookie(
             key=AUTH_COOKIE_NAME,
-            value=payload.username,
+            value=token,
             httponly=True,
             samesite="lax",
             path="/",
@@ -117,13 +124,18 @@ def create_app(frontend_dir: Path | None = None, db_path: Path | None = None) ->
         return {"status": "ok"}
 
     @app.post("/api/auth/logout")
-    async def logout(response: Response) -> dict[str, str]:
+    async def logout(
+        response: Response,
+        request: Request,
+        pm_auth: str | None = Cookie(default=None),
+    ) -> dict[str, str]:
+        if pm_auth:
+            request.app.state.sessions.pop(pm_auth, None)
         response.delete_cookie(key=AUTH_COOKIE_NAME, path="/")
         return {"status": "ok"}
 
     @app.get("/api/auth/me")
-    async def me(pm_auth: str | None = Cookie(default=None)) -> dict[str, str]:
-        username = _require_username(pm_auth)
+    async def me(username: str = Depends(require_username)) -> dict[str, str]:
         if not user_exists(app.state.db_path, username):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -132,8 +144,7 @@ def create_app(frontend_dir: Path | None = None, db_path: Path | None = None) ->
         return {"status": "authenticated", "username": username}
 
     @app.get("/api/board")
-    async def get_board(pm_auth: str | None = Cookie(default=None)) -> dict:
-        username = _require_username(pm_auth)
+    async def get_board(username: str = Depends(require_username)) -> dict:
         try:
             board = get_board_for_user(app.state.db_path, username)
         except BoardNotFoundError:
@@ -144,9 +155,8 @@ def create_app(frontend_dir: Path | None = None, db_path: Path | None = None) ->
     async def patch_column(
         column_id: str,
         payload: RenameColumnPayload,
-        pm_auth: str | None = Cookie(default=None),
+        username: str = Depends(require_username),
     ) -> dict:
-        username = _require_username(pm_auth)
         try:
             board = rename_column(app.state.db_path, username, column_id, payload.title)
         except ColumnNotFoundError:
@@ -156,15 +166,14 @@ def create_app(frontend_dir: Path | None = None, db_path: Path | None = None) ->
     @app.post("/api/cards")
     async def post_card(
         payload: CreateCardPayload,
-        pm_auth: str | None = Cookie(default=None),
+        username: str = Depends(require_username),
     ) -> dict:
-        username = _require_username(pm_auth)
         try:
             board = create_card(
                 app.state.db_path,
                 username,
                 payload.columnId,
-                payload.title.strip(),
+                payload.title,
                 payload.details.strip(),
             )
         except ColumnNotFoundError:
@@ -175,9 +184,8 @@ def create_app(frontend_dir: Path | None = None, db_path: Path | None = None) ->
     async def patch_card(
         card_id: str,
         payload: UpdateCardPayload,
-        pm_auth: str | None = Cookie(default=None),
+        username: str = Depends(require_username),
     ) -> dict:
-        username = _require_username(pm_auth)
         try:
             board = update_card(
                 app.state.db_path,
@@ -191,8 +199,10 @@ def create_app(frontend_dir: Path | None = None, db_path: Path | None = None) ->
         return {"board": board}
 
     @app.delete("/api/cards/{card_id}")
-    async def remove_card(card_id: str, pm_auth: str | None = Cookie(default=None)) -> dict:
-        username = _require_username(pm_auth)
+    async def remove_card(
+        card_id: str,
+        username: str = Depends(require_username),
+    ) -> dict:
         try:
             board = delete_card(app.state.db_path, username, card_id)
         except CardNotFoundError:
@@ -203,9 +213,8 @@ def create_app(frontend_dir: Path | None = None, db_path: Path | None = None) ->
     async def post_move_card(
         card_id: str,
         payload: MoveCardPayload,
-        pm_auth: str | None = Cookie(default=None),
+        username: str = Depends(require_username),
     ) -> dict:
-        username = _require_username(pm_auth)
         try:
             board = move_card(
                 app.state.db_path,
@@ -223,9 +232,8 @@ def create_app(frontend_dir: Path | None = None, db_path: Path | None = None) ->
     @app.post("/api/ai/chat")
     async def post_ai_chat(
         payload: AIChatPayload,
-        pm_auth: str | None = Cookie(default=None),
+        username: str = Depends(require_username),
     ) -> dict:
-        username = _require_username(pm_auth)
         user_message = payload.prompt.strip()
         if not user_message:
             raise HTTPException(status_code=400, detail="Prompt is required.")
@@ -269,7 +277,6 @@ def create_app(frontend_dir: Path | None = None, db_path: Path | None = None) ->
 
         return {
             "assistant": {"role": "assistant", "content": assistant_text},
-            "model": OPENROUTER_MODEL,
             "parsed": parsed,
             "boardUpdated": len(applied_operations) > 0,
             "appliedOperations": applied_operations,

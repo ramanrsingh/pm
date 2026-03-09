@@ -21,7 +21,6 @@ export type AIChatMessage = {
 
 type AIChatApiResponse = {
   assistant: AIChatMessage;
-  model: string;
   parsed: boolean;
   boardUpdated: boolean;
   appliedOperations: Array<{

@@ -53,6 +53,34 @@ def test_rename_column_persists(tmp_path: Path) -> None:
     assert column["title"] == "Ideas"
 
 
+def test_rename_column_empty_title_rejected(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    login(client)
+
+    response = client.patch("/api/columns/col-backlog", json={"title": ""})
+    assert response.status_code == 422
+
+    response = client.patch("/api/columns/col-backlog", json={"title": "   "})
+    assert response.status_code == 422
+
+
+def test_create_card_whitespace_title_rejected(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    login(client)
+
+    response = client.post(
+        "/api/cards",
+        json={"columnId": "col-backlog", "title": "   ", "details": ""},
+    )
+    assert response.status_code == 422
+
+    response = client.post(
+        "/api/cards",
+        json={"columnId": "col-backlog", "title": "", "details": ""},
+    )
+    assert response.status_code == 422
+
+
 def test_card_lifecycle_create_edit_move_delete(tmp_path: Path) -> None:
     client = make_client(tmp_path)
     login(client)
@@ -88,6 +116,19 @@ def test_card_lifecycle_create_edit_move_delete(tmp_path: Path) -> None:
     deleted = client.delete(f"/api/cards/{created_card_id}")
     assert deleted.status_code == 200
     assert created_card_id not in deleted.json()["board"]["cards"]
+
+
+def test_move_card_to_missing_column_returns_404(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    login(client)
+
+    response = client.post(
+        "/api/cards/card-1/move",
+        json={"columnId": "col-does-not-exist", "position": 0},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Column not found."
 
 
 def test_board_persists_across_app_recreation(tmp_path: Path) -> None:
