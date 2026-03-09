@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run:*)",
+      "Bash(where uv:*)",
+      "Read(//c/Users/admin/.local/bin//**)",
+      "Read(//c/Users/admin/.cargo/bin/**)",
+      "Read(//c/Users/admin/**)",
+      "Bash(npm run:*)",
+      "Bash(pip:*)",
+      "Bash(python:*)"
+    ]
+  }
+}
