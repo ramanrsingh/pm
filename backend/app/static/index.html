@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Project Management MVP</title>
+    <style>
+      :root {
+        --accent-yellow: #ecad0a;
+        --primary-blue: #209dd7;
+        --secondary-purple: #753991;
+        --navy-dark: #032147;
+        --gray-text: #888888;
+      }
+
+      body {
+        margin: 0;
+        font-family: "Segoe UI", Tahoma, sans-serif;
+        color: var(--navy-dark);
+        background: #f7f8fb;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+      }
+
+      .panel {
+        width: min(640px, calc(100vw - 2rem));
+        background: white;
+        border: 1px solid rgba(3, 33, 71, 0.12);
+        border-radius: 18px;
+        padding: 1.5rem;
+        box-shadow: 0 12px 24px rgba(3, 33, 71, 0.08);
+      }
+
+      h1 {
+        margin: 0;
+        color: var(--navy-dark);
+      }
+
+      p {
+        color: var(--gray-text);
+      }
+
+      pre {
+        background: #f3f6fb;
+        border-left: 4px solid var(--accent-yellow);
+        border-radius: 8px;
+        padding: 0.75rem;
+        overflow-x: auto;
+      }
+
+      a {
+        color: var(--primary-blue);
+      }
+    </style>
+  </head>
+  <body>
+    <main class="panel">
+      <h1>Project Management MVP</h1>
+      <p>FastAPI backend is running in Docker and serving this static page at <code>/</code>.</p>
+      <p>Health check from <code>/api/health</code>:</p>
+      <pre id="health-output">Loading...</pre>
+      <p><a href="/api/health">Open raw API response</a></p>
+    </main>
+
+    <script>
+      async function loadHealth() {
+        const output = document.getElementById("health-output");
+        try {
+          const response = await fetch("/api/health");
+          const data = await response.json();
+          output.textContent = JSON.stringify(data, null, 2);
+        } catch (error) {
+          output.textContent = `Failed to load /api/health: ${error}`;
+        }
+      }
+
+      void loadHealth();
+    </script>
+  </body>
+</html>
