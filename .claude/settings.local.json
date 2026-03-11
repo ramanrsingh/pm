@@ -10,7 +10,9 @@
       "Bash(pip:*)",
       "Bash(python:*)",
       "Bash(docker:*)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(npx vitest:*)",
+      "Skill(ralph-loop:cancel-ralph)"
     ]
   }
 }

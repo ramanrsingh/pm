@@ -5,9 +5,18 @@ import type { Card, Column } from "@/lib/kanban";
 import { KanbanCard } from "@/components/KanbanCard";
 import { NewCardForm } from "@/components/NewCardForm";
 
+const COLUMN_ACCENTS = [
+  { color: "#209dd7", label: "blue" },
+  { color: "#ecad0a", label: "yellow" },
+  { color: "#753991", label: "purple" },
+  { color: "#0ea5a0", label: "teal" },
+  { color: "#e07c3a", label: "orange" },
+];
+
 type KanbanColumnProps = {
   column: Column;
   cards: Card[];
+  index: number;
   onRename: (columnId: string, title: string) => void;
   onAddCard: (columnId: string, title: string, details: string) => void;
   onDeleteCard: (columnId: string, cardId: string) => void;
@@ -16,38 +25,58 @@ type KanbanColumnProps = {
 export const KanbanColumn = ({
   column,
   cards,
+  index,
   onRename,
   onAddCard,
   onDeleteCard,
 }: KanbanColumnProps) => {
   const { setNodeRef, isOver } = useDroppable({ id: column.id });
+  const accent = COLUMN_ACCENTS[index % COLUMN_ACCENTS.length];
 
   return (
     <section
       ref={setNodeRef}
       className={clsx(
-        "flex min-h-[520px] flex-col rounded-3xl border border-[var(--stroke)] bg-[var(--surface-strong)] p-4 shadow-[var(--shadow)] transition",
-        isOver && "ring-2 ring-[var(--accent-yellow)]"
+        "flex min-h-[520px] flex-col rounded-3xl border bg-[var(--surface-strong)] p-4 transition-all duration-200",
+        isOver
+          ? "border-[var(--accent-yellow)] shadow-[0_0_0_2px_rgba(236,173,10,0.25),var(--shadow-lg)]"
+          : "border-[var(--stroke)] shadow-[var(--shadow)]"
       )}
       data-testid={`column-${column.id}`}
     >
-      <div className="flex items-start justify-between gap-3">
+      {/* Colored top accent strip */}
+      <div
+        className="mb-4 h-[3px] w-full rounded-full transition-all duration-200"
+        style={{
+          background: isOver
+            ? "var(--accent-yellow)"
+            : accent.color,
+        }}
+      />
+
+      <div className="flex items-start gap-3">
         <div className="w-full">
-          <div className="flex items-center gap-3">
-            <div className="h-2 w-10 rounded-full bg-[var(--accent-yellow)]" />
-            <span className="text-xs font-semibold uppercase tracking-[0.2em] text-[var(--gray-text)]">
-              {cards.length} cards
+          <div className="flex items-center gap-2">
+            <span
+              className="flex h-5 min-w-[20px] items-center justify-center rounded-full px-1.5 text-[10px] font-bold text-white"
+              style={{ background: accent.color }}
+            >
+              {cards.length}
+            </span>
+            <span className="text-[10px] font-semibold uppercase tracking-[0.22em] text-[var(--gray-text)]">
+              cards
             </span>
           </div>
           <input
             value={column.title}
             onChange={(event) => onRename(column.id, event.target.value)}
-            className="mt-3 w-full bg-transparent font-display text-lg font-semibold text-[var(--navy-dark)] outline-none"
+            className="mt-2 w-full bg-transparent font-display text-base font-semibold text-[var(--navy-dark)] outline-none transition-colors duration-150 hover:text-[var(--primary-blue)] focus:text-[var(--primary-blue)]"
             aria-label="Column title"
           />
         </div>
       </div>
-      <div className="mt-4 flex flex-1 flex-col gap-3">
+
+      <div className="mt-4 flex flex-1 flex-col gap-2.5">
         <SortableContext items={column.cardIds} strategy={verticalListSortingStrategy}>
           {cards.map((card) => (
             <KanbanCard
@@ -58,14 +87,21 @@ export const KanbanColumn = ({
           ))}
         </SortableContext>
         {cards.length === 0 && (
-          <div className="flex flex-1 items-center justify-center rounded-2xl border border-dashed border-[var(--stroke)] px-3 py-6 text-center text-xs font-semibold uppercase tracking-[0.2em] text-[var(--gray-text)]">
-            Drop a card here
+          <div
+            className={clsx(
+              "flex flex-1 items-center justify-center rounded-2xl border border-dashed px-3 py-6 text-center transition-all duration-200",
+              "text-xs font-semibold uppercase tracking-[0.18em]",
+              isOver
+                ? "border-[var(--accent-yellow)] bg-[rgba(236,173,10,0.04)] text-[var(--accent-yellow)]"
+                : "border-[var(--stroke)] text-[var(--gray-text)]"
+            )}
+          >
+            {isOver ? "Release to drop" : "Drop a card here"}
           </div>
         )}
       </div>
-      <NewCardForm
-        onAdd={(title, details) => onAddCard(column.id, title, details)}
-      />
+
+      <NewCardForm onAdd={(title, details) => onAddCard(column.id, title, details)} />
     </section>
   );
 };

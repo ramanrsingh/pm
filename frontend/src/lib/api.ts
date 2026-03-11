@@ -7,11 +7,21 @@ type BoardApiCard = {
   metadata?: unknown;
 };
 
+type BoardApiPayload = {
+  id: string;
+  name: string;
+  columns: BoardData["columns"];
+  cards: Record<string, BoardApiCard>;
+};
+
 type BoardApiResponse = {
-  board: {
-    columns: BoardData["columns"];
-    cards: Record<string, BoardApiCard>;
-  };
+  board: BoardApiPayload;
+};
+
+export type BoardSummary = {
+  id: string;
+  name: string;
+  createdAt: string;
 };
 
 export type AIChatMessage = {
@@ -30,11 +40,13 @@ type AIChatApiResponse = {
     columnId?: string;
   }>;
   operationErrors: string[];
-  board: BoardApiResponse["board"];
+  board: BoardApiPayload;
 };
 
 const toBoardData = (payload: BoardApiResponse): BoardData => {
   return {
+    id: payload.board.id,
+    name: payload.board.name,
     columns: payload.board.columns,
     cards: Object.fromEntries(
       Object.entries(payload.board.cards).map(([id, card]) => [
@@ -75,6 +87,54 @@ const requestJson = async <T>(url: string, init?: RequestInit): Promise<T> => {
   return (await response.json()) as T;
 };
 
+// ===== Auth =====
+
+export const register = async (username: string, password: string): Promise<void> => {
+  await requestJson("/api/auth/register", {
+    method: "POST",
+    body: JSON.stringify({ username, password }),
+  });
+};
+
+export const changePassword = async (
+  currentPassword: string,
+  newPassword: string
+): Promise<void> => {
+  await requestJson("/api/auth/password", {
+    method: "PATCH",
+    body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+  });
+};
+
+// ===== Board list =====
+
+export const fetchBoards = async (): Promise<BoardSummary[]> => {
+  const payload = await requestJson<{ boards: BoardSummary[] }>("/api/boards", { method: "GET" });
+  return payload.boards;
+};
+
+export const createBoard = async (name: string): Promise<BoardData> => {
+  const payload = await requestJson<BoardApiResponse>("/api/boards", {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
+  return toBoardData(payload);
+};
+
+export const renameBoard = async (boardId: string, name: string): Promise<BoardData> => {
+  const payload = await requestJson<BoardApiResponse>(`/api/boards/${boardId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ name }),
+  });
+  return toBoardData(payload);
+};
+
+export const deleteBoard = async (boardId: string): Promise<void> => {
+  await requestJson(`/api/boards/${boardId}`, { method: "DELETE" });
+};
+
+// ===== Board fetch =====
+
 export const fetchBoard = async (): Promise<BoardData> => {
   const payload = await requestJson<BoardApiResponse>("/api/board", {
     method: "GET",
@@ -82,31 +142,68 @@ export const fetchBoard = async (): Promise<BoardData> => {
   return toBoardData(payload);
 };
 
+export const fetchBoardById = async (boardId: string): Promise<BoardData> => {
+  const payload = await requestJson<BoardApiResponse>(`/api/boards/${boardId}`, {
+    method: "GET",
+  });
+  return toBoardData(payload);
+};
+
+// ===== Column management =====
+
+export const addColumn = async (boardId: string, title: string): Promise<BoardData> => {
+  const payload = await requestJson<BoardApiResponse>(
+    `/api/boards/${boardId}/columns`,
+    {
+      method: "POST",
+      body: JSON.stringify({ title }),
+    }
+  );
+  return toBoardData(payload);
+};
+
 export const renameColumn = async (
   columnId: string,
-  title: string
+  title: string,
+  boardId?: string
 ): Promise<BoardData> => {
-  const payload = await requestJson<BoardApiResponse>(`/api/columns/${columnId}`, {
+  const url = boardId
+    ? `/api/boards/${boardId}/columns/${columnId}`
+    : `/api/columns/${columnId}`;
+  const payload = await requestJson<BoardApiResponse>(url, {
     method: "PATCH",
     body: JSON.stringify({ title }),
   });
   return toBoardData(payload);
 };
 
+export const deleteColumn = async (boardId: string, columnId: string): Promise<BoardData> => {
+  const payload = await requestJson<BoardApiResponse>(
+    `/api/boards/${boardId}/columns/${columnId}`,
+    { method: "DELETE" }
+  );
+  return toBoardData(payload);
+};
+
+// ===== Card management =====
+
 export const createCard = async (
   columnId: string,
   title: string,
-  details: string
+  details: string,
+  boardId?: string
 ): Promise<BoardData> => {
-  const payload = await requestJson<BoardApiResponse>("/api/cards", {
+  const url = boardId ? `/api/boards/${boardId}/cards` : "/api/cards";
+  const payload = await requestJson<BoardApiResponse>(url, {
     method: "POST",
     body: JSON.stringify({ columnId, title, details }),
   });
   return toBoardData(payload);
 };
 
-export const deleteCard = async (cardId: string): Promise<BoardData> => {
-  const payload = await requestJson<BoardApiResponse>(`/api/cards/${cardId}`, {
+export const deleteCard = async (cardId: string, boardId?: string): Promise<BoardData> => {
+  const url = boardId ? `/api/boards/${boardId}/cards/${cardId}` : `/api/cards/${cardId}`;
+  const payload = await requestJson<BoardApiResponse>(url, {
     method: "DELETE",
   });
   return toBoardData(payload);
@@ -115,9 +212,13 @@ export const deleteCard = async (cardId: string): Promise<BoardData> => {
 export const moveCard = async (
   cardId: string,
   columnId: string,
-  position: number | null
+  position: number | null,
+  boardId?: string
 ): Promise<BoardData> => {
-  const payload = await requestJson<BoardApiResponse>(`/api/cards/${cardId}/move`, {
+  const url = boardId
+    ? `/api/boards/${boardId}/cards/${cardId}/move`
+    : `/api/cards/${cardId}/move`;
+  const payload = await requestJson<BoardApiResponse>(url, {
     method: "POST",
     body: JSON.stringify({ columnId, position }),
   });
@@ -125,14 +226,16 @@ export const moveCard = async (
 };
 
 export const chatWithAssistant = async (
-  prompt: string
+  prompt: string,
+  boardId?: string
 ): Promise<{
   assistant: AIChatMessage;
   board: BoardData;
   boardUpdated: boolean;
   operationErrors: string[];
 }> => {
-  const payload = await requestJson<AIChatApiResponse>("/api/ai/chat", {
+  const url = boardId ? `/api/boards/${boardId}/chat` : "/api/ai/chat";
+  const payload = await requestJson<AIChatApiResponse>(url, {
     method: "POST",
     body: JSON.stringify({ prompt }),
   });

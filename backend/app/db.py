@@ -4,6 +4,7 @@ import secrets
 import sqlite3
 from pathlib import Path
 
+# TODO: Replace with environment-variable-based credentials before production.
 MVP_USERNAME = "user"
 MVP_PASSWORD = "password"
 
@@ -79,6 +80,9 @@ DEFAULT_CARDS = [
 # constraint collisions during cross-column moves.
 _REINDEX_PLACEHOLDER = -(10 ** 6)
 
+# Current schema version. Increment when making breaking schema changes.
+_SCHEMA_VERSION = 2
+
 
 class BoardNotFoundError(Exception):
     pass
@@ -89,6 +93,14 @@ class ColumnNotFoundError(Exception):
 
 
 class CardNotFoundError(Exception):
+    pass
+
+
+class UserAlreadyExistsError(Exception):
+    pass
+
+
+class BoardPermissionError(Exception):
     pass
 
 
@@ -118,6 +130,40 @@ def _verify_password(value: str, stored: str) -> bool:
         return False
 
 
+def _get_schema_version(connection: sqlite3.Connection) -> int:
+    return int(connection.execute("PRAGMA user_version").fetchone()[0])
+
+
+def _set_schema_version(connection: sqlite3.Connection, version: int) -> None:
+    connection.execute(f"PRAGMA user_version = {version}")
+
+
+def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+    """Remove UNIQUE(user_id) constraint from boards to allow multiple boards per user."""
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS boards_new (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL DEFAULT 'Project Board',
+            settings_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        INSERT OR IGNORE INTO boards_new SELECT * FROM boards;
+
+        DROP TABLE boards;
+
+        ALTER TABLE boards_new RENAME TO boards;
+
+        CREATE INDEX IF NOT EXISTS idx_boards_user_id ON boards(user_id);
+        """
+    )
+    _set_schema_version(connection, 2)
+
+
 def initialize_database(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -134,7 +180,7 @@ def initialize_database(db_path: Path) -> None:
 
             CREATE TABLE IF NOT EXISTS boards (
               id TEXT PRIMARY KEY,
-              user_id INTEGER NOT NULL UNIQUE,
+              user_id INTEGER NOT NULL,
               name TEXT NOT NULL DEFAULT 'Project Board',
               settings_json TEXT NOT NULL DEFAULT '{}',
               created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -195,6 +241,23 @@ def initialize_database(db_path: Path) -> None:
             CREATE INDEX IF NOT EXISTS idx_messages_thread_id_created_at ON chat_messages(thread_id, created_at);
             """
         )
+
+        # Run migrations for existing databases.
+        version = _get_schema_version(connection)
+        if version < 2:
+            # Check if boards table has the old UNIQUE(user_id) constraint by trying to detect it.
+            # In fresh DBs created above, the constraint is already absent; skip migration.
+            index_rows = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='boards'"
+            ).fetchall()
+            index_names = [row["name"] for row in index_rows]
+            # Old schema had a sqlite_autoindex for the unique constraint.
+            has_unique_index = any("autoindex" in name.lower() for name in index_names)
+            if has_unique_index:
+                _migrate_v1_to_v2(connection)
+            else:
+                _set_schema_version(connection, _SCHEMA_VERSION)
+
         _seed_mvp_user_data(connection)
 
 
@@ -221,7 +284,7 @@ def _seed_mvp_user_data(connection: sqlite3.Connection) -> None:
         """
         INSERT INTO boards (id, user_id, name)
         VALUES (?, ?, 'Project Board')
-        ON CONFLICT(user_id) DO NOTHING
+        ON CONFLICT(id) DO NOTHING
         """,
         (board_id, user_row["id"]),
     )
@@ -278,22 +341,86 @@ def verify_credentials(db_path: Path, username: str, password: str) -> bool:
         return _verify_password(password, row["password_hash"])
 
 
+def register_user(db_path: Path, username: str, password: str) -> None:
+    """Create a new user account. Raises UserAlreadyExistsError if username is taken."""
+    with _connect(db_path) as connection:
+        existing = connection.execute(
+            "SELECT 1 FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+        if existing is not None:
+            raise UserAlreadyExistsError(username)
+
+        connection.execute(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            (username, _hash_password(password)),
+        )
+        user_row = connection.execute(
+            "SELECT id FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+        board_id = f"board-{user_row['id']}"
+        connection.execute(
+            "INSERT INTO boards (id, user_id, name) VALUES (?, ?, 'Project Board')",
+            (board_id, user_row["id"]),
+        )
+        connection.executemany(
+            "INSERT INTO board_columns (id, board_id, title, position) VALUES (?, ?, ?, ?)",
+            [(f"{column_id}-u{user_row['id']}", board_id, title, position) for column_id, title, position in DEFAULT_COLUMNS],
+        )
+
+
+def change_password(db_path: Path, username: str, current_password: str, new_password: str) -> bool:
+    """Change a user's password. Returns False if current_password is wrong."""
+    if not verify_credentials(db_path, username, current_password):
+        return False
+    with _connect(db_path) as connection:
+        connection.execute(
+            "UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE username = ?",
+            (_hash_password(new_password), username),
+        )
+    return True
+
+
 def _get_board_id(connection: sqlite3.Connection, username: str) -> str:
+    """Return the first/default board id for the user."""
     board_row = connection.execute(
         """
         SELECT b.id AS board_id
         FROM boards b
         INNER JOIN users u ON u.id = b.user_id
         WHERE u.username = ?
+        ORDER BY b.created_at ASC
+        LIMIT 1
         """,
         (username,),
     ).fetchone()
     if board_row is None:
         raise BoardNotFoundError(f"Board not found for user: {username}")
-    return str(board_row["board_id"])
+    return board_row["board_id"]
+
+
+def _validate_board_ownership(connection: sqlite3.Connection, username: str, board_id: str) -> None:
+    """Raise BoardNotFoundError if board_id does not belong to username."""
+    row = connection.execute(
+        """
+        SELECT b.id
+        FROM boards b
+        INNER JOIN users u ON u.id = b.user_id
+        WHERE u.username = ? AND b.id = ?
+        """,
+        (username, board_id),
+    ).fetchone()
+    if row is None:
+        raise BoardNotFoundError(f"Board {board_id!r} not found for user {username!r}.")
 
 
 def _build_board_payload(connection: sqlite3.Connection, board_id: str) -> dict:
+    board_row = connection.execute(
+        "SELECT id, name FROM boards WHERE id = ?",
+        (board_id,),
+    ).fetchone()
+
     column_rows = connection.execute(
         """
         SELECT id, title
@@ -314,36 +441,116 @@ def _build_board_payload(connection: sqlite3.Connection, board_id: str) -> dict:
         (board_id,),
     ).fetchall()
 
-    cards_by_column: dict[str, list[str]] = {str(column["id"]): [] for column in column_rows}
+    cards_by_column: dict[str, list[str]] = {column["id"]: [] for column in column_rows}
     cards: dict[str, dict] = {}
 
     for row in card_rows:
-        card_id = str(row["id"])
-        column_id = str(row["column_id"])
+        card_id = row["id"]
+        column_id = row["column_id"]
         cards_by_column.setdefault(column_id, []).append(card_id)
         cards[card_id] = {
             "id": card_id,
-            "title": str(row["title"]),
-            "details": str(row["details"]),
-            "metadata": json.loads(str(row["metadata_json"])),
+            "title": row["title"],
+            "details": row["details"],
+            "metadata": json.loads(row["metadata_json"]),
         }
 
     columns = [
         {
-            "id": str(column["id"]),
-            "title": str(column["title"]),
-            "cardIds": cards_by_column.get(str(column["id"]), []),
+            "id": column["id"],
+            "title": column["title"],
+            "cardIds": cards_by_column.get(column["id"], []),
         }
         for column in column_rows
     ]
 
-    return {"columns": columns, "cards": cards}
+    return {
+        "id": board_id,
+        "name": board_row["name"] if board_row else "Project Board",
+        "columns": columns,
+        "cards": cards,
+    }
 
 
 def get_board_for_user(db_path: Path, username: str) -> dict:
     with _connect(db_path) as connection:
         board_id = _get_board_id(connection, username)
         return _build_board_payload(connection, board_id)
+
+
+def get_board_by_id(db_path: Path, username: str, board_id: str) -> dict:
+    with _connect(db_path) as connection:
+        _validate_board_ownership(connection, username, board_id)
+        return _build_board_payload(connection, board_id)
+
+
+def list_boards_for_user(db_path: Path, username: str) -> list[dict]:
+    with _connect(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT b.id, b.name, b.created_at
+            FROM boards b
+            INNER JOIN users u ON u.id = b.user_id
+            WHERE u.username = ?
+            ORDER BY b.created_at ASC
+            """,
+            (username,),
+        ).fetchall()
+        return [{"id": row["id"], "name": row["name"], "createdAt": row["created_at"]} for row in rows]
+
+
+def create_board(db_path: Path, username: str, name: str) -> dict:
+    """Create a new board for a user with default columns. Returns the new board payload."""
+    with _connect(db_path) as connection:
+        user_row = connection.execute(
+            "SELECT id FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+        if user_row is None:
+            raise BoardNotFoundError(f"User {username!r} not found.")
+
+        board_id = f"board-{secrets.token_hex(8)}"
+        connection.execute(
+            "INSERT INTO boards (id, user_id, name) VALUES (?, ?, ?)",
+            (board_id, user_row["id"], name),
+        )
+
+        for column_id, title, position in DEFAULT_COLUMNS:
+            new_col_id = f"{column_id}-{secrets.token_hex(4)}"
+            connection.execute(
+                "INSERT INTO board_columns (id, board_id, title, position) VALUES (?, ?, ?, ?)",
+                (new_col_id, board_id, title, position),
+            )
+
+        return _build_board_payload(connection, board_id)
+
+
+def rename_board(db_path: Path, username: str, board_id: str, name: str) -> dict:
+    with _connect(db_path) as connection:
+        _validate_board_ownership(connection, username, board_id)
+        connection.execute(
+            "UPDATE boards SET name = ?, updated_at = datetime('now') WHERE id = ?",
+            (name, board_id),
+        )
+        return _build_board_payload(connection, board_id)
+
+
+def delete_board(db_path: Path, username: str, board_id: str) -> None:
+    with _connect(db_path) as connection:
+        _validate_board_ownership(connection, username, board_id)
+        # Ensure user has at least one board remaining after deletion.
+        board_count = connection.execute(
+            """
+            SELECT COUNT(1) AS cnt
+            FROM boards b
+            INNER JOIN users u ON u.id = b.user_id
+            WHERE u.username = ?
+            """,
+            (username,),
+        ).fetchone()["cnt"]
+        if board_count <= 1:
+            raise BoardPermissionError("Cannot delete the last board.")
+        connection.execute("DELETE FROM boards WHERE id = ?", (board_id,))
 
 
 def rename_column(db_path: Path, username: str, column_id: str, title: str) -> dict:
@@ -359,6 +566,52 @@ def rename_column(db_path: Path, username: str, column_id: str, title: str) -> d
         )
         if result.rowcount == 0:
             raise ColumnNotFoundError(column_id)
+        return _build_board_payload(connection, board_id)
+
+
+def rename_column_on_board(db_path: Path, username: str, board_id: str, column_id: str, title: str) -> dict:
+    with _connect(db_path) as connection:
+        _validate_board_ownership(connection, username, board_id)
+        result = connection.execute(
+            """
+            UPDATE board_columns
+            SET title = ?, updated_at = datetime('now')
+            WHERE board_id = ? AND id = ?
+            """,
+            (title, board_id, column_id),
+        )
+        if result.rowcount == 0:
+            raise ColumnNotFoundError(column_id)
+        return _build_board_payload(connection, board_id)
+
+
+def add_column(db_path: Path, username: str, board_id: str, title: str) -> dict:
+    """Add a new column to the specified board."""
+    with _connect(db_path) as connection:
+        _validate_board_ownership(connection, username, board_id)
+        next_position = connection.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 AS next_pos FROM board_columns WHERE board_id = ?",
+            (board_id,),
+        ).fetchone()["next_pos"]
+        column_id = f"col-{secrets.token_hex(6)}"
+        connection.execute(
+            "INSERT INTO board_columns (id, board_id, title, position) VALUES (?, ?, ?, ?)",
+            (column_id, board_id, title, int(next_position)),
+        )
+        return _build_board_payload(connection, board_id)
+
+
+def delete_column(db_path: Path, username: str, board_id: str, column_id: str) -> dict:
+    """Delete a column (and all its cards) from the specified board."""
+    with _connect(db_path) as connection:
+        _validate_board_ownership(connection, username, board_id)
+        col_row = connection.execute(
+            "SELECT id FROM board_columns WHERE board_id = ? AND id = ?",
+            (board_id, column_id),
+        ).fetchone()
+        if col_row is None:
+            raise ColumnNotFoundError(column_id)
+        connection.execute("DELETE FROM board_columns WHERE id = ?", (column_id,))
         return _build_board_payload(connection, board_id)
 
 
@@ -492,6 +745,15 @@ def create_card(db_path: Path, username: str, column_id: str, title: str, detail
         return _build_board_payload(connection, board_id)
 
 
+def create_card_on_board(
+    db_path: Path, username: str, board_id: str, column_id: str, title: str, details: str
+) -> dict:
+    with _connect(db_path) as connection:
+        _validate_board_ownership(connection, username, board_id)
+        _do_create_card(connection, board_id, column_id, title, details)
+        return _build_board_payload(connection, board_id)
+
+
 def update_card(
     db_path: Path,
     username: str,
@@ -505,9 +767,46 @@ def update_card(
         return _build_board_payload(connection, board_id)
 
 
+def update_card_on_board(
+    db_path: Path,
+    username: str,
+    board_id: str,
+    card_id: str,
+    title: str | None,
+    details: str | None,
+) -> dict:
+    with _connect(db_path) as connection:
+        _validate_board_ownership(connection, username, board_id)
+        _do_update_card(connection, board_id, card_id, title, details)
+        return _build_board_payload(connection, board_id)
+
+
 def delete_card(db_path: Path, username: str, card_id: str) -> dict:
     with _connect(db_path) as connection:
         board_id = _get_board_id(connection, username)
+
+        card_row = connection.execute(
+            "SELECT column_id, position FROM cards WHERE board_id = ? AND id = ?",
+            (board_id, card_id),
+        ).fetchone()
+        if card_row is None:
+            raise CardNotFoundError(card_id)
+
+        column_id = str(card_row["column_id"])
+        position = int(card_row["position"])
+
+        connection.execute("DELETE FROM cards WHERE id = ?", (card_id,))
+        connection.execute(
+            "UPDATE cards SET position = position - 1 WHERE column_id = ? AND position > ?",
+            (column_id, position),
+        )
+
+        return _build_board_payload(connection, board_id)
+
+
+def delete_card_on_board(db_path: Path, username: str, board_id: str, card_id: str) -> dict:
+    with _connect(db_path) as connection:
+        _validate_board_ownership(connection, username, board_id)
 
         card_row = connection.execute(
             "SELECT column_id, position FROM cards WHERE board_id = ? AND id = ?",
@@ -541,12 +840,26 @@ def move_card(
         return _build_board_payload(connection, board_id)
 
 
+def move_card_on_board(
+    db_path: Path,
+    username: str,
+    board_id: str,
+    card_id: str,
+    destination_column_id: str,
+    destination_position: int | None,
+) -> dict:
+    with _connect(db_path) as connection:
+        _validate_board_ownership(connection, username, board_id)
+        _do_move_card(connection, board_id, card_id, destination_column_id, destination_position)
+        return _build_board_payload(connection, board_id)
+
+
 def _load_ordered_card_ids(connection: sqlite3.Connection, column_id: str) -> list[str]:
     rows = connection.execute(
         "SELECT id FROM cards WHERE column_id = ? ORDER BY position ASC",
         (column_id,),
     ).fetchall()
-    return [str(row["id"]) for row in rows]
+    return [row["id"] for row in rows]
 
 
 def _reindex_column(
@@ -618,7 +931,32 @@ def list_chat_messages_for_user(
             (thread_id, max(1, limit)),
         ).fetchall()
 
-        messages = [{"role": str(row["role"]), "content": str(row["content"])} for row in rows]
+        messages = [{"role": row["role"], "content": row["content"]} for row in rows]
+        messages.reverse()
+        return messages
+
+
+def list_chat_messages_for_board(
+    db_path: Path,
+    username: str,
+    board_id: str,
+    limit: int = 30,
+) -> list[dict[str, str]]:
+    with _connect(db_path) as connection:
+        _validate_board_ownership(connection, username, board_id)
+        thread_id = _get_or_create_thread_id(connection, board_id)
+        rows = connection.execute(
+            """
+            SELECT role, content
+            FROM chat_messages
+            WHERE thread_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (thread_id, max(1, limit)),
+        ).fetchall()
+
+        messages = [{"role": row["role"], "content": row["content"]} for row in rows]
         messages.reverse()
         return messages
 
@@ -635,6 +973,37 @@ def append_chat_message_for_user(
 
     with _connect(db_path) as connection:
         board_id = _get_board_id(connection, username)
+        thread_id = _get_or_create_thread_id(connection, board_id)
+        connection.execute(
+            """
+            INSERT INTO chat_messages (thread_id, role, content, metadata_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (thread_id, role, content, json.dumps(metadata or {})),
+        )
+        connection.execute(
+            """
+            UPDATE chat_threads
+            SET updated_at = datetime('now')
+            WHERE id = ?
+            """,
+            (thread_id,),
+        )
+
+
+def append_chat_message_for_board(
+    db_path: Path,
+    username: str,
+    board_id: str,
+    role: str,
+    content: str,
+    metadata: dict | None = None,
+) -> None:
+    if role not in {"user", "assistant", "system"}:
+        raise ValueError(f"Unsupported role: {role}")
+
+    with _connect(db_path) as connection:
+        _validate_board_ownership(connection, username, board_id)
         thread_id = _get_or_create_thread_id(connection, board_id)
         connection.execute(
             """
